@@ -58,6 +58,63 @@ def compute_pairs_freqs(word_freqs: dict[Word, int]) -> Counter[Pair]:
 
     return pair_freqs
 
+# yeilds adjacent pairs in a word of token_ids
+def iter_pairs(word: Word):
+    for i in range(len(word) - 1):
+        yield word[i], word[i+1]
+
+
+# pair pointing to all words it exists
+def build_pair_to_words(word_freqs: dict[Word, int]) -> dict[Pair, set[Word]]:
+    pair_to_words: dict[Pair, set[Word]] = defaultdict(set)
+
+    for word in word_freqs:
+        # We use set(iter_pairs(word)) because if a word has the same pair many times,
+        # we still only need to remember this word once.
+        for pair in set(iter_pairs(word)):
+            pair_to_words[pair].add(word)
+
+    return pair_to_words
+
+
+# update pair_freqs, pair_to_words stats after merging all instances of the best_pair
+def update_pair_stats_for_word(
+    word: Word,
+    freq: int,
+    pair_freqs: Counter[Pair],
+    pair_to_words: dict[Pair, set[Word]],
+    delta: int,
+) -> None:
+    # delta = -1 means remove old_words, +1 means add stats of new_words
+
+    seen_pairs: set[Pair] = set()
+
+    for pair in iter_pairs(word):
+        # adds/subtracts freq of old_pairs of old_word and new_pairs of new_word
+        pair_freqs[pair] += delta * freq
+        # if count becomes zero or negative, remove it. keeps pair_freqs clean.
+        if pair_freqs[pair] <= 0:
+            del pair_freqs[pair]
+        # pair_to_words has unique words, so we only have to add/remove word once
+        if pair in seen_pairs:
+            continue
+
+        if delta > 0:
+            # New word exists now, so this pair should point to it.
+            pair_to_words[pair].add(word)
+        else:
+            # Old word is being removed, so this pair should no longer point to it.
+            if pair in pair_to_words:
+                pair_to_words[pair].discard(word)
+
+                # if no words contain this pair anymore, remove the pair entry.
+                if not pair_to_words[pair]:
+                    del pair_to_words[pair]
+
+        seen_pairs.add(pair)
+
+
+        
 
 def train_bpe_slow(
     text: str,
@@ -106,6 +163,86 @@ def train_bpe_slow(
             new_word_freqs[new_word] += freq
         
         word_freqs = new_word_freqs
+
+    return TokenizerSpec(vocab=vocab, merges=merges, special_tokens=special_tokens)
+
+
+def train_bpe_fast_v1(
+    text: str,
+    vocab_size: int,
+    special_tokens: tuple[str, ...] = (),
+    pretokenizer: Pretokenizer = gpt2_pretokenize,
+) -> TokenizerSpec:
+    if vocab_size < 256:
+        raise ValueError("vocab_size must be at least 256")
+
+    vocab = create_initial_vocab(special_tokens)
+    special_set = set(special_tokens)
+
+    # Same as slow version:
+    # count how often each pretoken appears.
+    pretoken_counts = Counter(pretokenizer(text, special_tokens))
+    word_freqs: dict[Word, int] = defaultdict(int)
+
+    for pretoken, count in pretoken_counts.items():
+        if pretoken in special_set:
+            continue
+
+        word = tuple(pretoken.encode("utf-8"))
+        if word:
+            word_freqs[word] += count
+
+    merges: list[tuple[bytes, bytes]] = []
+
+    # Unlike slow BPE, we build this once and update it after each merge.
+    pair_freqs = compute_pairs_freqs(word_freqs)
+
+    # New: it lets us jump directly to words containing the best pair.
+    pair_to_words = build_pair_to_words(word_freqs)
+
+    while len(vocab) < vocab_size:
+        if not pair_freqs:
+            break
+        
+        # This is okay because profiling showed max is not the main bottleneck yet.
+        best_pair = max(pair_freqs,key=lambda pair: (pair_freqs[pair], vocab[pair[0]], vocab[pair[1]],))
+
+        new_token_id = len(vocab)
+        left_bytes = vocab[best_pair[0]]
+        right_bytes = vocab[best_pair[1]]
+
+        vocab[new_token_id] = left_bytes + right_bytes
+        merges.append((left_bytes, right_bytes))
+
+        # optimization:- only these words can possibly change.
+        affected_words = list(pair_to_words.get(best_pair, set()))
+
+        # collect updates first instead of modifying word_freqs while iterating.
+        affected_updates: list[tuple[Word, Word, int]] = []
+
+        for old_word in affected_words:
+
+            freq = word_freqs[old_word]
+            new_word = merge_pair(old_word, best_pair, new_token_id)
+
+            affected_updates.append((old_word, new_word, freq))
+
+        # step 1:
+        # Remove old words from word_freqs, pair_freqs, and pair_to_words.
+        for old_word, _, freq in affected_updates:
+            update_pair_stats_for_word(
+                word=old_word, freq=freq, pair_freqs=pair_freqs, pair_to_words=pair_to_words, delta=-1,
+            )
+
+            del word_freqs[old_word]
+
+        # step 2: add new merges words into word_freqs, pair_freqs, and pair_to_words.
+        for _, new_word, freq in affected_updates:
+            word_freqs[new_word] += freq
+
+            update_pair_stats_for_word(
+                word=new_word, freq=freq, pair_freqs=pair_freqs, pair_to_words=pair_to_words, delta=1,
+            )
 
     return TokenizerSpec(vocab=vocab, merges=merges, special_tokens=special_tokens)
 
@@ -196,5 +333,4 @@ class BPETokenizer:
     
 
     
-
 
